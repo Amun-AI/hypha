@@ -1,10 +1,12 @@
 """Provide the server."""
+
 import argparse
 import logging
 import sys
 from os import environ as env
 from pathlib import Path
 
+from contextlib import asynccontextmanager
 from dotenv import find_dotenv, load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -152,17 +154,6 @@ def start_builtin_services(
 
         return JSONResponse({"status": "DOWN"}, status_code=503)
 
-    @app.on_event("startup")
-    async def startup_event():
-        # Here we can register all the startup functions
-        args.startup_functions = args.startup_functions or []
-        args.startup_functions.append("hypha.core.auth:register_login_service")
-        await store.init(args.reset_redis, startup_functions=args.startup_functions)
-
-    @app.on_event("shutdown")
-    def shutdown_event():
-        store.get_event_bus().emit("shutdown", target="local")
-
 
 def mount_static_files(app, new_route, directory, name="static"):
     # Get top level route paths
@@ -200,6 +191,16 @@ def create_application(args):
     else:
         args.allow_origins = env.get("ALLOW_ORIGINS", "*").split(",")
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Here we can register all the startup functions
+        args.startup_functions = args.startup_functions or []
+        args.startup_functions.append("hypha.core.auth:register_login_service")
+        await store.init(args.reset_redis, startup_functions=args.startup_functions)
+        yield
+        # Clean up the ML models and release the resources
+        store.get_event_bus().emit("shutdown", target="local")
+
     application = FastAPI(
         title="Hypha",
         docs_url="/api-docs",
@@ -209,6 +210,7 @@ def create_application(args):
                 large-scale data management and AI model serving"
         ),
         version=VERSION,
+        lifespan=lifespan,
     )
     application.router.route_class = GzipRoute
 
@@ -235,7 +237,7 @@ def create_application(args):
         public_base_url=public_base_url,
         local_base_url=local_base_url,
         redis_uri=args.redis_uri,
-        disconnect_delay=float(env.get("DISCONNECT_DELAY", "30")),
+        disconnect_delay=float(env.get("DISCONNECT_DELAY", "3600")),
     )
 
     start_builtin_services(application, store, args)

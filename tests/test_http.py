@@ -5,6 +5,7 @@ import json
 import msgpack
 import numpy as np
 import pytest
+import httpx
 import requests
 from imjoy_rpc.hypha.websocket_client import connect_to_server
 
@@ -16,7 +17,9 @@ pytestmark = pytest.mark.asyncio
 TEST_APP_CODE = """
 api.export({
     async setup(){
-        await api.register_service(
+    },
+    async register_services(){
+        const service_info1 = await api.register_service(
             {
                 "id": "test_service",
                 "name": "test_service",
@@ -30,7 +33,8 @@ api.export({
                 }
             }
         )
-        await api.register_service(
+        console.log(`registered test_service: ${service_info1.id}`)
+        const service_info2 = await api.register_service(
             {
                 "id": "test_service_protected",
                 "name": "test_service_protected",
@@ -44,9 +48,76 @@ api.export({
                 }
             }
         )
+        console.log(`registered test_service: ${service_info2.id}`)
+        return [service_info1, service_info2]
     }
 })
 """
+
+
+async def test_services(minio_server, fastapi_server, test_user_token):
+    api = await connect_to_server(
+        {
+            "name": "test client",
+            "server_url": WS_SERVER_URL,
+            "method_timeout": 10,
+            "token": test_user_token,
+        }
+    )
+    workspace = api.config["workspace"]
+    await api.register_service(
+        {
+            "id": "test_service",
+            "name": "test_service",
+            "type": "test_service",
+            "config": {
+                "visibility": "public",
+            },
+            "echo": lambda data: data,
+        }
+    )
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        data = await client.get(f"{SERVER_URL}/services/openapi.json")
+        data = data.json()
+        assert data.get("detail") != "Not Found"
+        assert data["info"]["title"] == "Hypha Services"
+        paths = data["paths"]
+        assert "/call" in paths
+        assert "/list" in paths
+
+        url = f"{SERVER_URL}/services/call"
+        data = await client.post(
+            url,
+            json={
+                "workspace": workspace,
+                "service_id": "test_service",
+                "function_key": "echo",
+                "function_kwargs": {"data": "123"},
+            },
+        )
+        assert data.status_code == 200
+        assert data.json() == "123"
+
+        url = (
+            f"{SERVER_URL}/services/call?workspace={workspace}&service_id=test_service&function_key=echo&function_kwargs="
+            + json.dumps({"data": "123"})
+        )
+        data = await client.get(url)
+        assert data.status_code == 200
+        assert data.json() == "123"
+
+        url = f"{SERVER_URL}/{workspace}/services/test_service/echo"
+        data = await client.post(url, json={"data": "123"})
+        assert data.status_code == 200
+        assert data.json() == "123"
+
+        data = await client.get(f"{SERVER_URL}/services/list?workspace={workspace}")
+        print(data.json())
+        # [{'config': {'visibility': 'public', 'require_context': False, 'workspace': 'VRRVEdTF9of2y4cLmepzBw', 'flags': []}, 'id': '5XCPAyZrW72oBzywEk2oxP:test_service', 'name': 'test_service', 'type': 'test_service', 'description': '', 'docs': {}}]
+        assert data.status_code == 200
+        assert data.json()[0]["name"] == "test_service"
+
+    await api.disconnect()
 
 
 # pylint: disable=too-many-statements
@@ -72,18 +143,18 @@ async def test_http_proxy(minio_server, fastapi_server, test_user_token):
         wait_for_service=None,
     )
     plugin = await api.get_plugin(config.id)
-    assert "setup" in plugin
-    await plugin.setup()
+    assert "setup" in plugin and "register_services" in plugin
+    svc1, svc2 = await plugin.register_services()
 
     service_ws = plugin.config.workspace
     assert service_ws
-    service = await api.get_service("test_service")
+    service = await api.get_service(svc1["id"])
     assert await service.echo("233d") == "233d"
 
-    service = await api.get_service("test_service_protected")
+    service = await api.get_service(svc2["id"])
     assert await service.echo("22") == "22"
 
-    response = requests.get(f"{SERVER_URL}/workspaces")
+    response = requests.get(f"{SERVER_URL}/workspaces/list")
     assert response.ok, response.json()["detail"]
     response = response.json()
     assert workspace in response
